@@ -48,8 +48,8 @@ class Initializer(object):
             self._init_mean(desc, arr)
         elif desc.endswith('var'):
             self._init_var(desc, arr)
-        else:
-            self._init_default(desc, arr)
+        #else:
+        #    self._init_default(desc, arr)
 
     def _init_bias(self, _, arr):
         arr[:] = 0.0

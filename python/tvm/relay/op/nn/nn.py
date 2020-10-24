@@ -1834,3 +1834,23 @@ def cross_entropy_with_logits(predictions, targets):
       The computed result.
     """
     return _make.cross_entropy_with_logits(predictions, targets)
+
+
+def sparse_conv2d(data,
+                  weight,
+                  block_size=None,
+                  num_nnz_blocks=None,
+                  strides=(1, 1),
+                  padding=(0, 0),
+                  dilation=(1, 1),
+                  groups=1,
+                  channels=None,
+                  kernel_size=None,
+                  data_layout="NCHW",
+                  kernel_layout="OIHW",
+                  out_layout="",
+                  out_dtype=""):
+    return _make.sparse_conv2d(data, weight.data, weight.indices, weight.indptr,
+                        block_size, num_nnz_blocks, strides, padding, dilation,
+                        groups, channels, kernel_size, data_layout,
+                        kernel_layout, out_layout, out_dtype)

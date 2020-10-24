@@ -40,3 +40,4 @@ from .batch_matmul import *
 from .sparse import *
 from .pad import *
 from .fifo_buffer import *
+from .tunable_sparse import *

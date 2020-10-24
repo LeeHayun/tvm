@@ -964,3 +964,45 @@ def pad_shape_func(attrs, inputs, _):
 reg.register_shape_func("nn.bias_add", False, elemwise_shape_func)
 reg.register_shape_func("nn.softmax", False, elemwise_shape_func)
 reg.register_shape_func("nn.relu", False, elemwise_shape_func)
+
+# sparse_conv2d
+@reg.register_compute("nn.sparse_conv2d")
+def compute_sparse_conv2d(attrs, inputs, out_type, target):
+    """Compute definition of sparse_conv2d"""
+    padding = get_const_tuple(attrs.padding)
+    strides = get_const_tuple(attrs.strides)
+    dilation = get_const_tuple(attrs.dilation)
+    groups = attrs.groups
+    layout = attrs.data_layout
+    kernel_layout = attrs.kernel_layout
+    kernel_size = get_const_tuple(attrs.kernel_size)
+    out_dtype = attrs.out_dtype
+    out_dtype = (inputs[0].dtype if out_dtype in ("same", "")
+                 else out_dtype)
+
+    assert layout in ["NCHW"]
+    (dilation_h, dilation_w) = dilation
+    if dilation_h != 1 or dilation_w != 1:
+        raise ValueError("dilation should be 1")
+
+    if groups == 1:
+        out = topi.nn.sparse_conv2d(
+            inputs[0], inputs[1], inputs[2], inputs[3],
+            kernel_size, strides, padding, dilation, layout, out_dtype)
+    else:
+        raise ValueError("only support 1 group")
+    return [out]
+
+@reg.register_schedule("nn.sparse_conv2d")
+def schedule_sparse_conv2d(attrs, outs, target):
+    """Schedule definition of sparse_conv2d"""
+    groups = attrs.groups
+    layout = attrs.data_layout
+    kernel_layout = attrs.kernel_layout
+
+    with target:
+        if groups == 1 and layout == "NCHW":
+            return topi.generic.schedule_sparse_conv2d_nchw(outs)
+    raise ValueError("No compatible schedule")
+
+reg.register_pattern("nn.sparse_conv2d", OpPattern.OUT_ELEMWISE_FUSABLE)
