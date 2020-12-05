@@ -517,3 +517,314 @@ def conv2d_direct_simd(cfg, data, kernel, strides, padding, dilation, out_dtype)
 def schedule_conv2d_direct_simd(cfg, outs):
     """Create schedule for conv2d_direct_simd"""
     return direct_simd.conv2d_direct_simd_nhwc_schedule(cfg, outs)
+
+
+
+@autotvm.register_topi_compute("sparse_conv2d_nchw.arm_cpu")
+def sparse_conv2d_nchw(cfg, data, kernel_data, kernel_indices, kernel_indptr, kernel_size, strides, padding, dilation, layout, out_dtype):
+    if layout == 'NCHW':
+        if isinstance(kernel_size, int):
+            KH = KW = kernel_size
+        else:
+            KH, KW = kernel_size
+
+        if KH == 1 and KW == 1:
+            return sparse_conv2d_nchw_autotvm(cfg, data, kernel_data, kernel_indices, kernel_indptr,
+                                      kernel_size, strides, padding, dilation, out_dtype)
+        else:
+            return sparse_depthwise_conv2d_nchw_autotvm(cfg, data, kernel_data, kernel_indices, kernel_indptr,
+                                                        kernel_size, strides, padding, dilation, out_dtype)
+    else:
+        raise ValueError("Unsupported layout {}.".format(layout))
+
+
+@autotvm.register_topi_schedule("sparse_conv2d_nchw.arm_cpu")
+def schedule_sparse_conv2d_nchw(cfg, outs):
+    s = te.create_schedule([x.op for x in outs])
+    conv = None
+    data = None
+    data_vec = None
+    data_pad = None
+    kernel_data_vec = None
+    output = None
+    kernel_data = None
+    kernel_indptr = None
+    kernel_indices = None
+
+    def _callback(op):
+        if op.tag == 'sparse_conv2d_output' in op.tag:
+            output = op.output(0)
+            conv = op.input_tensors[0]
+
+            data_vec = conv.op.input_tensors[2]
+            data_pad = data_vec.op.input_tensors[0]
+            s[data_pad].compute_inline()
+
+            kernel_data_vec = conv.op.input_tensors[3]
+            if kernel_data_vec.op.name == 'kernel_data_vec':
+                kernel = kernel_data_vec.op.input_tensors[0]
+            else:
+                kernel = kernel_data_vec
+
+            schedule_sparse_conv2d_nchw_autotvm(cfg, s, data_vec, kernel_data_vec, conv, output, outs[0])
+
+        if op.tag == 'spatial_depthwise_conv2d_nchw_output':
+            output = op.output(0)
+            conv = op.input_tensors[0]
+            data_vec = conv.op.input_tensors[2]
+            kernel_data_vec = conv.op.input_tensors[3]
+
+            #data_pad = data_vec.op.input_tensors[0]
+            #data = data_pad.op.input_tensors[0]
+            #kernel_indptr = conv.op.input_tensors[0]
+            #kernel_indices = conv.op.input_tensors[1]
+            #kernel_data = kernel_data_vec.op.input_tensors[0]
+
+
+            _schedule_spatial_pack(cfg, s, data_vec, kernel_data_vec, conv, output, outs[0])
+            #print(tvm.lower(s, [data, kernel_data, kernel_indices, kernel_indptr], simple_mode=True))
+
+    traverse_inline(s, outs[0].op, _callback)
+    return s
+
+def sparse_conv2d_nchw_autotvm(cfg, data, kernel_data, kernel_indices, kernel_indptr,
+                               kernel_size, strides, padding, dilation, out_dtype):
+    out_dtype = out_dtype or data.dtype
+    N, CI, IH, IW = get_const_tuple(data.shape)
+
+    if isinstance(kernel_size, int):
+        KH = KW = kernel_size
+    else:
+        KH, KW = kernel_size
+
+    if isinstance(strides, int):
+        HSTR = WSTR = strides
+    else:
+        HSTR, WSTR = strides
+
+    if len(kernel_data.shape) == 1:
+        CO = get_const_int(kernel_indptr.shape[0] - 1)
+    elif len(kernel_data.shape) == 3:
+        CO = get_const_int((kernel_indptr.shape[0] - 1) * kernel_data.shape[1])
+    else:
+        raise ValueError("Only CSR or BSR supported")
+
+    pad_top, pad_left, pad_bottom, pad_right = get_pad_tuple(
+        padding, (KH, KW))
+    OH = (IH + pad_top + pad_bottom - KH) // HSTR + 1
+    OW = (IW + pad_left + pad_right - KW) // WSTR + 1
+    data_pad = nn.pad(data, [0, 0, pad_top, pad_left], [0, 0, pad_bottom, pad_right])
+
+    NNZ, BS_O, BS_I_KH_KW = get_const_tuple(kernel_data.shape)
+    BS_I = BS_I_KH_KW // (KH * KW)
+    NUM_BLKS_PLUS_1, = get_const_tuple(kernel_indptr.shape)
+    NB_O = NUM_BLKS_PLUS_1 - 1    # NUM_BLKS = CO // BS_O
+    NB_I = CI // BS_I
+
+
+    nb_o, bs_o, oh, ow = cfg.axis(NB_O), cfg.axis(BS_O), cfg.axis(OH), cfg.axis(OW)
+    kh, kw = cfg.reduce_axis(KH), cfg.reduce_axis(KW)
+
+    nb_o, vnb_o = cfg.define_split('tile_nb_o', nb_o, num_outputs=2, candidate=[[-1,4]])
+    oh, vh = cfg.define_split('tile_oh', oh, num_outputs=2)
+    ow, vw = cfg.define_split('tile_ow', ow, num_outputs=2)
+
+    cfg.define_reorder("reorder_0",
+                       [vh, vw, vnb_o, bs_o],
+                       policy='candidate', candidate=[
+                           [vh, vw, vnb_o, bs_o],
+                           [vnb_o, bs_o, vh, vw]])
+
+    cfg.define_annotate('ann_reduce', [kh, kw], policy='try_unroll')
+    cfg.define_annotate('ann_spatial', [vh, vw, vnb_o, bs_o], policy='try_unroll_vec')
+
+    VNB_O = cfg['tile_nb_o'].size[-1]
+    VH = cfg["tile_oh"].size[-1]
+    VW = cfg["tile_ow"].size[-1]
+
+    dvshape = (N, OH // VH, OW // VW, NB_I, BS_I, VH, VW)
+    data_vec = te.compute(dvshape, lambda n, h, w, nb_i, bs_i, vh, vw:
+                           data_pad[n][nb_i*BS_I+bs_i][h*VH*HSTR+vh][w*VW*WSTR+vw],
+                           name='data_vec')
+
+    kdvshape = (NNZ, BS_I, KH, KW, BS_O)
+    kernel_data_vec = te.compute(kdvshape, lambda nnz, bs_i, kh, kw, bs_o:
+                                  kernel_data[nnz, bs_o, bs_i*KH*KW+kh*KW+kw],
+                                  name='kernel_data_vec')
+
+    bs_i = te.reduce_axis((0, BS_I), name='bs_i')
+    kh = te.reduce_axis((0, KH), name='kh')
+    kw = te.reduce_axis((0, KW), name='kw')
+
+    def _sparse_conv2d(n, nb_o, h, w, vh, vw, vnb_o, bs_o):
+        row_start = kernel_indptr[nb_o*VNB_O+vnb_o]
+        row_end = kernel_indptr[nb_o*VNB_O+vnb_o + 1]
+        row_elems = row_end - row_start
+
+        elem_idx = te.reduce_axis((0, row_elems), name="elem_idx")
+        block_offset = row_start + elem_idx
+
+        data_val = data_vec[n][h][w][kernel_indices[block_offset]][bs_i][vh*HSTR+kh][vw*WSTR+kw]
+        kernel_val = kernel_data_vec[block_offset][bs_i][kh][kw][bs_o]
+
+        return te.sum(data_val * kernel_val, axis=[elem_idx, bs_i, kh, kw])
+
+    ovshape = (N, NB_O // VNB_O, OH // VH, OW // VW, VH, VW, VNB_O, BS_O)
+    conv = te.compute(ovshape, _sparse_conv2d, name='conv')
+
+    idxd = tvm.tir.indexdiv
+    idxm = tvm.tir.indexmod
+
+    oshape = (N, CO, OH, OW)
+    output = te.compute(oshape, lambda n, co, h, w:
+                         conv[n,
+                              idxd(co, VNB_O*BS_O), idxd(h, VH), idxd(w, VW),
+                              idxm(h, VH), idxm(w, VW), idxm(idxd(co, BS_O), VNB_O), idxm(co, BS_O)],
+                         name='output_unpack', tag='sparse_conv2d_output')
+
+    '''
+    dvshape = (N, OH, OW, NB_I, BS_I)
+    data_vec = tvm.compute(dvshape, lambda n, h, w, nb_i, bs_i:
+                           data_pad[n][nb_i*BS_I+bs_i][h*HSTR][w*WSTR],
+                           name='data_vec')
+
+    kdvshape = (NNZ, KH, KW, BS_I, BS_O)
+    kernel_data_vec = tvm.compute(kdvshape, lambda nnz, kh, kw, bs_i, bs_o:
+                                  kernel_data[nnz][bs_o][bs_i*KH*KW + kh*KW + kw],
+                                  name='kernel_data_vec')
+
+    bs_i = tvm.reduce_axis((0, BS_I), name='bs_i')
+    kh = tvm.reduce_axis((0, KH), name='kh')
+    kw = tvm.reduce_axis((0, KW), name='kw')
+
+    def _sparse_conv2d(n, h, w, nb_o, bs_o):
+        row_start = kernel_indptr[nb_o]
+        row_end = kernel_indptr[nb_o + 1]
+        row_elems = row_end - row_start
+
+        elem_idx = tvm.reduce_axis((0, row_elems), name="elem_idx")
+        block_offset = row_start + elem_idx
+
+        data_val = data_vec[n][h*HSTR+kh][w*WSTR+kw][kernel_indices[block_offset]][bs_i]
+        kernel_val = kernel_data_vec[block_offset][kh][kw][bs_i][bs_o]
+
+        return tvm.sum(data_val * kernel_val, axis=[elem_idx, kh, kw, bs_i])
+
+    ovshape = (N, OH, OW, NB_O, BS_O)
+    conv = tvm.compute(ovshape, _sparse_conv2d, name='conv')
+
+    idxd = tvm.indexdiv
+    idxm = tvm.indexmod
+
+    oshape = (N, CO, OH, OW)
+    output = tvm.compute(oshape, lambda n, co, h, w:
+                         conv[n][h][w][idxd(co, BS_O)][idxm(co, BS_O)],
+                         name='output',
+                         tag='sparse_conv2d_output')
+    '''
+
+    # ================== define configuration space =========================
+    cfg.add_flop(2*N*OH*OW*KH*KW*BS_O*BS_I*NNZ)
+
+
+    return output
+
+def schedule_sparse_conv2d_nchw_autotvm(cfg, s, data_vec, kernel_data_vec, conv, output, last):
+    n, nb_o, oh, ow, vh, vw, vnb_o, bs_o = s[conv].op.axis
+    elem_idx, bs_i, kh, kw = s[conv].op.reduce_axis
+    BS_O = get_const_int(s[kernel_data_vec].op.axis[-1].dom.extent)
+
+    # schedule conv
+    s[conv].reorder(n, nb_o, oh, ow, elem_idx, bs_i, kh, kw, vh, vw, vnb_o, bs_o)
+    cfg['reorder_0'].apply(s, conv, [vh, vw, vnb_o, bs_o])
+    cfg['ann_reduce'].apply(s, conv, [kh, kw],
+                            axis_lens=[get_const_int(kh.dom.extent),
+                                       get_const_int(kw.dom.extent)],
+                            max_unroll=16,
+                            cfg=cfg)
+    cfg['ann_spatial'].apply(s, conv, [vh, vw, vnb_o, bs_o],
+                             axis_lens=[cfg['tile_oh'].size[-1],
+                                        cfg['tile_ow'].size[-1],
+                                        cfg['tile_nb_o'].size[-1],
+                                        BS_O],
+                             max_unroll=16,
+                             cfg=cfg)
+
+    # scehdule fusion
+    n, co, h, w = s[last].op.axis
+    nb_o, bs_o = s[last].split(co, BS_O)
+    oh, vh = cfg['tile_oh'].apply(s, last, h)
+    ow, vw = cfg['tile_ow'].apply(s, last, w)
+    nb_o, vnb_o = cfg['tile_nb_o'].apply(s, last, nb_o)
+    s[last].reorder(n, nb_o, oh, ow, vh, vw, vnb_o, bs_o)
+    if last != output:
+        s[output].compute_inline()
+        cfg['ann_spatial'].apply(s, last, [vh, vw, vnb_o, bs_o],
+                                 axis_lens=[cfg['tile_oh'].size[-1],
+                                            cfg['tile_ow'].size[-1],
+                                            cfg['tile_nb_o'].size[-1],
+                                            BS_O],
+                                 max_unroll=16,
+                                 cfg=cfg)
+    #cfg['reorder_0'].apply(s, last, [vh, vw, vnb_o, bs_o])
+    s[conv].compute_at(s[last], ow)
+
+    # mark parallel
+    s[last].parallel(nb_o)
+
+    #_, h, _, _, _, _ = s[data_vec].op.axis
+    s[data_vec].parallel(s[data_vec].op.axis[1])
+
+    #nnz, _, _, _, _ = s[kernel_data_vec].op.axis
+    s[kernel_data_vec].parallel(s[kernel_data_vec].op.axis[0])
+
+    return s
+
+    '''
+    num_spatial_axis = len(s[conv].op.axis)
+    parallel_candidate = [i+1 for i in range(num_spatial_axis*2)]
+
+    _define_split(s, cfg, conv, pattern='ssnrsrs')
+    cfg.define_knob("auto_unroll_max_step", [0, 16, 64, 512])
+    cfg.define_knob("follow_split", [1, 2])
+    cfg.define_knob("parallel", parallel_candidate)
+
+
+    """schedule implementation"""
+    # schedule fusion
+    _apply_and_reorder(s, cfg, conv, pattern='ssnrsrs')
+
+    BS_O = get_const_int(s[data_vec].op.axis[-1].dom.extent)
+
+    n, c, h , w = s[last].op.axis
+    nbo, bs_o = s[last].split(c, BS_O)
+    s[last].reorder(n, h, w, nbo, bs_o)
+    _follow_split(s, cfg, last, conv, n_split=cfg['follow_split'].val)
+
+    if last != output:
+        s[output].compute_inline()
+
+    _compute_at(s, conv, last, cfg['follow_split'].val * num_spatial_axis)
+
+    # Inline Step
+    #s[reshaped_data_pad].compute_inline()
+    #s[data_pad].compute_inline()
+
+    # vectorize
+    #tmp = _parallel(s, conv, 5)
+    _vectorize(s, conv)
+    _vectorize(s, last)
+
+    # mark parallel
+    _parallel(s, data_vec, 2)
+    tmp = _parallel(s, last, cfg['parallel'].val)
+    s[last].pragma(tmp, "auto_unroll_max_step", cfg["auto_unroll_max_step"].val)
+
+    nnz = s[kernel_data_vec].op.axis[0]
+    if autotvm.GLOBAL_SCOPE.in_tuning:
+        s[kernel_data_vec].pragma(nnz, 'debug_skip_region')
+    else:
+        s[kernel_data_vec].parallel(nnz)
+
+    return s
+    '''

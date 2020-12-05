@@ -915,6 +915,27 @@ def _hardtanh():
     return _impl
 
 
+def random_bsr_matrix(M, N, BS_R, BS_C, density, dtype):
+    import numpy as np
+    import scipy.sparse as sp
+    import itertools
+    Y = np.zeros((M, N), dtype=dtype)
+    assert M % BS_R == 0
+    assert N % BS_C == 0
+    nnz = int(density * M * N)
+    num_blocks = int(nnz / (BS_R * BS_C)) + 1
+    candidate_blocks = np.asarray(list(itertools.product(range(0, M, BS_R), range(0, N, BS_C))))
+    assert candidate_blocks.shape[0] == M // BS_R * N // BS_C
+    chosen_blocks = candidate_blocks[np.random.choice(candidate_blocks.shape[0], size=num_blocks, replace=False)]
+    for i in range(len(chosen_blocks)):
+        r, c = chosen_blocks[i]
+        Y[r:r + BS_R, c:c + BS_C] = np.random.randn(BS_R, BS_C)
+    s = sp.bsr_matrix(Y, blocksize=(BS_R, BS_C))
+    assert s.data.shape == (num_blocks, BS_R, BS_C)
+    assert s.indices.shape == (num_blocks, )
+    assert s.indptr.shape == (M // BS_R + 1, )
+    return s
+
 def _convolution():
     def _impl(inputs, input_types):
         # Use transpose or normal
@@ -983,20 +1004,49 @@ def _convolution():
             data = _op.expand_dims(data, axis=2)
             weight = _op.expand_dims(weight, axis=2)
 
-        conv_out = conv_op(
-            data,
-            weight,
-            strides=strides,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            channels=channels,
-            kernel_size=[1] + kernel_size if len(kernel_size) == 1 else kernel_size,
-            data_layout=data_layout,
-            kernel_layout=kernel_layout,
-            out_layout="",
-            out_dtype="",
-        )
+        # HAHA
+        data_shape = _infer_shape(data)
+        if data_shape[-1] != 1 and weight_shape[-1] == 1 and False:
+            from collections import namedtuple
+            density = 0.2
+            in_channels = weight_shape[1]
+            out_channels = weight_shape[0]
+            N = out_channels
+            K = in_channels * kernel_size[0] * kernel_size[1]
+            BS_R, BS_C = 4, 1
+            W_sp_np = random_bsr_matrix(N, K, BS_R, BS_C, density=density, dtype="float32")
+
+            weight_data = _expr.Constant(tvm.nd.array(W_sp_np.data))
+            weight_indices = _expr.Constant(tvm.nd.array(W_sp_np.indices))
+            weight_indptr = _expr.Constant(tvm.nd.array(W_sp_np.indptr))
+
+            Adjacency = namedtuple('Adjacency', ['data', 'indices', 'indptr'])
+            new_weight = Adjacency(weight_data, weight_indices, weight_indptr)
+
+            conv_out = _op.nn.sparse_conv2d(
+                data,
+                new_weight,
+                strides=strides,
+                padding=padding,
+                groups=1,
+                channels=out_channels,
+                kernel_size=kernel_size,
+            )
+        else:
+            conv_out = conv_op(
+                data,
+                weight,
+                strides=strides,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                channels=channels,
+                kernel_size=[1] + kernel_size if len(kernel_size) == 1 else kernel_size,
+                data_layout=data_layout,
+                kernel_layout=kernel_layout,
+                out_layout="",
+                out_dtype="",
+            )
         if use_bias:
             res = _op.nn.bias_add(conv_out, bias)
         else:

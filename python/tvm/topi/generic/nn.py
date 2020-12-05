@@ -744,3 +744,6 @@ def schedule_correlation_nchw(outs):
         The computation schedule for the op.
     """
     return _default_schedule(outs, False)
+
+def schedule_sparse_conv2d_nchw(outs):
+    return _default_schedule(outs, False)

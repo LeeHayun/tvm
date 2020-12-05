@@ -392,3 +392,33 @@ def schedule_bitserial_dense_arm_cpu(attrs, inputs, out_type, target):
         name="bitserial_dense.arm_cpu",
     )
     return strategy
+
+
+@sparse_conv2d_strategy.register(["arm_cpu"])
+def conv2d_strategy_arm_cpu(attrs, inputs, out_type, target):
+    """sparse_conv2d arm cpu strategy"""
+    strategy = _op.OpStrategy()
+
+    padding = get_const_tuple(attrs.padding)
+    strides = get_const_tuple(attrs.strides)
+    dilation = get_const_tuple(attrs.dilation)
+    groups = attrs.groups
+    layout = attrs.data_layout
+    kernel_layout = attrs.kernel_layout
+    kernel_size = get_const_tuple(attrs.kernel_size)
+    out_dtype = attrs.out_dtype
+    out_dtype = (inputs[0].dtype if out_dtype in ("same", "")
+                 else out_dtype)
+
+    assert layout in ["NCHW"]
+    (dilation_h, dilation_w) = dilation
+    if dilation_h != 1 or dilation_w != 1:
+        raise ValueError("dilation should be 1")
+
+    strategy.add_implementation(
+        wrap_compute_sparse_conv2d(topi.arm_cpu.sparse_conv2d_nchw),
+        wrap_topi_schedule(topi.arm_cpu.schedule_sparse_conv2d_nchw),
+        name="sparse_conv2d_nchw.arm_cpu",
+    )
+
+    return strategy

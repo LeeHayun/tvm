@@ -943,3 +943,66 @@ def unpack_NCHWc_to_nchw(packed_out, out_dtype):
         tag=tag.INJECTIVE + ",unpack_nchwc",
     )
     return unpacked_out
+
+
+
+def sparse_conv2d_nchw(Input, Filter_data, Filter_indices, Filter_indptr, kernel_size, stride, padding, dilation, out_dtype=None):
+    return Input
+    '''
+    if out_dtype is None:
+        out_dtype = Input.dtype
+    assert isinstance(kernel_size, int) or len(kernel_size) == 2
+    assert isinstance(stride, int) or len(stride) == 2
+    assert isinstance(dilation, int) or len(dilation) == 2
+    if isinstance(kernel_size, int):
+        kernel_h = kernel_w = kernel_size
+    else:
+        kernel_h, kernel_w = kernel_size
+
+    if isinstance(stride, int):
+        stride_h = stride_w = stride
+    else:
+        stride_h, stride_w = stride
+
+    if isinstance(dilation, int):
+        dilation_h = dilation_w = dilation
+    else:
+        dilation_h, dilation_w = dilation
+
+    batch, in_channel, in_height, in_width = Input.shape
+    if len(Filter_data.shape) == 1:
+        num_filter = Filter_indptr.shape[0] - 1
+    elif len(Filter_data.shape) == 3:
+        num_filter = (Filter_indptr.shape[0] - 1) * Filter_data.shape[1]
+    else:
+        raise ValueError("Only CSR or BSR supported")
+    channel = in_channel
+    # compute the output shape
+    dilated_kernel_h = (kernel_h - 1) * dilation_h + 1
+    dilated_kernel_w = (kernel_w - 1) * dilation_w + 1
+    pad_top, pad_left, pad_down, pad_right = get_pad_tuple(
+        padding, (dilated_kernel_h, dilated_kernel_w))
+    out_channel = num_filter
+    out_height = simplify((in_height - dilated_kernel_h + pad_top + pad_down) // stride_h + 1)
+    out_width = simplify((in_width - dilated_kernel_w + pad_left + pad_right) // stride_w + 1)
+    # compute graph
+    pad_before = [0, 0, pad_top, pad_left]
+    pad_after = [0, 0, pad_down, pad_right]
+    if pad_top != 0 or pad_left != 0 or pad_down != 0 or pad_right != 0:
+        temp = pad(Input, pad_before, pad_after, name="pad_temp")
+    else:
+        temp = Input
+
+
+    im2col_out_shape = (batch, in_channel, kernel_h, kernel_w, out_height, out_width)
+    def f(b, c, h, w , out_h, out_w):
+        return temp[b, c, h + stride_h*out_h, w + stride_w*out_w]
+    im2col_input = tvm.compute(im2col_out_shape, f, name='col')
+    im2col_input = topi.reshape(im2col_input, newshape=(batch*in_channel*kernel_h*kernel_w, out_height*out_width))
+
+    output = _sparse_dense_bsrmm_v2(im2col_input, Filter_data, Filter_indices, Filter_indptr)
+    output_shape = (batch, out_channel, out_height, out_width)
+    output = topi.reshape(output, newshape=output_shape)
+
+    return output
+    '''

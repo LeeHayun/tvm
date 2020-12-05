@@ -1168,3 +1168,58 @@ def correlation_strategy(attrs, inputs, out_type, target):
         name="correlation.generic",
     )
     return strategy
+
+
+# sparse_conv2d
+def wrap_compute_sparse_conv2d(
+    topi_compute, need_data_layout=False, need_out_layout=False, has_groups=False
+):
+    def _compute_sparse_conv2d(attrs, inputs, out_type):
+        kernel_size = get_const_tuple(attrs.kernel_size)
+        padding = get_const_tuple(attrs.padding)
+        strides = get_const_tuple(attrs.strides)
+        dilation = get_const_tuple(attrs.dilation)
+        data_layout = attrs.get_str("data_layout")
+        out_layout = attrs.get_str("out_layout")
+        out_dtype = attrs.out_dtype
+        out_dtype = inputs[0].dtype if out_dtype in ("same", "") else out_dtype
+        args = [inputs[0], inputs[1], inputs[2], inputs[3], kernel_size, strides, padding, dilation, data_layout]
+        if has_groups:
+            args.append(attrs.groups)
+        if need_data_layout:
+            args.append(data_layout)
+        if need_out_layout:
+            args.append(out_layout)
+        args.append(out_dtype)
+        return [topi_compute(*args)]
+
+    return _compute_sparse_conv2d
+
+@override_native_generic_func("sparse_conv2d_strategy")
+def sparse_conv2d_strategy(attrs, inputs, out_type, target):
+    logger.warning("sparse_conv2d is not optimized for this platform.")
+    strategy = _op.OpStrategy()
+
+    padding = get_const_tuple(attrs.padding)
+    strides = get_const_tuple(attrs.strides)
+    dilation = get_const_tuple(attrs.dilation)
+    groups = attrs.groups
+    layout = attrs.data_layout
+    kernel_layout = attrs.kernel_layout
+    kernel_size = get_const_tuple(attrs.kernel_size)
+    out_dtype = attrs.out_dtype
+    out_dtype = (inputs[0].dtype if out_dtype in ("same", "")
+                 else out_dtype)
+
+    assert layout in ["NCHW"]
+    (dilation_h, dilation_w) = dilation
+    if dilation_h != 1 or dilation_w != 1:
+        raise ValueError("dilation should be 1")
+
+    strategy.add_implementation(
+        wrap_compute_sparse_conv2d(topi.nn.sparse_conv2d_nchw),
+        wrap_topi_schedule(topi.nn.schedule_sparse_conv2d_nchw),
+        name="sparse_conv2d_nchw.generic",
+    )
+
+    return strategy

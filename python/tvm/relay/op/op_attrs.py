@@ -532,3 +532,8 @@ class TupleGetItemAttrs(Attrs):
 @tvm._ffi.register_object("relay.attrs.WithFuncIdAttrs")
 class WithFuncIdAttrs(Attrs):
     """Attributes used in with_funcid annotation operators"""
+
+
+@tvm._ffi.register_object("relay.attrs.SparseConv2DAttrs")
+class SparseConv2DAttrs(Attrs):
+    """Attributes used in sparse_conv2d operators"""

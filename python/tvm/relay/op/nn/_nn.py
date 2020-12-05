@@ -1008,3 +1008,8 @@ def dilate_shape_func(attrs, inputs, _):
 reg.register_shape_func("nn.bias_add", False, elemwise_shape_func)
 reg.register_shape_func("nn.softmax", False, elemwise_shape_func)
 reg.register_shape_func("nn.relu", False, elemwise_shape_func)
+
+
+# sparse_conv2d
+reg.register_strategy("nn.sparse_conv2d", strategy.sparse_conv2d_strategy)
+reg.register_pattern("nn.sparse_conv2d", OpPattern.OUT_ELEMWISE_FUSABLE)
